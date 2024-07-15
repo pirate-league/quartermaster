@@ -6,6 +6,12 @@ import { HatsModule } from "hats-module/HatsModule.sol";
 import { IBaal } from "baal/interfaces/IBaal.sol";
 import { IBaalToken } from "baal/interfaces/IBaalToken.sol";
 
+struct Orders {
+  bool isOnboarding;
+  uint256 until;
+  uint256 shares;
+}
+
 /**
  * @title Quartermaster Shaman
  * @notice A Baal manager shaman that allows onboarding, offboarding, and other DAO member management
@@ -28,8 +34,7 @@ contract QuartermasterShaman is HatsModule {
 
   event OnboardedBatch(address[] members, uint256[] sharesPending, uint256 delay);
   event OffboardedBatch(address[] members, uint256[] sharesPending, uint256 delay);
-  event Quartered(address[] members, uint256[] shares);
-  event Unquartered(address[] members, uint256[] shares);
+  event Quartered(address[] members, uint256[] shares, bool[] inbound);
 
   /*//////////////////////////////////////////////////////////////
                           PUBLIC CONSTANTS
@@ -63,8 +68,6 @@ contract QuartermasterShaman is HatsModule {
     return IBaal(_getArgAddress(72));
   }
 
-  // OWNER_HAT is renamed to CAPTAIN_HAT for this use
-  // TODO I think this is wrong, this is brought from parent, captain should be initarg
   function CAPTAIN_HAT() public pure returns (uint256) {
     return _getArgUint256(92);
   }
@@ -85,8 +88,7 @@ contract QuartermasterShaman is HatsModule {
                           MUTABLE STATE
   //////////////////////////////////////////////////////////////*/
 
-  mapping(address => uint256) public onboardingDelay;
-  mapping(address => uint256) public offboardingDelay;
+  mapping(address => Orders) public orders;
 
   /*//////////////////////////////////////////////////////////////
                           CONSTRUCTOR
@@ -112,14 +114,15 @@ contract QuartermasterShaman is HatsModule {
   function onboard(address[] calldata _members) external wearsCaptainHat(msg.sender) {
     uint256 length = _members.length;
     uint256 delay = _calculateDelay();
+    uint256 startingShares = STARTING_SHARES(); // avoid repeated fn
     uint256[] memory amounts = new uint256[](length);
     address member;
 
     for (uint256 i; i < length;) {
       member = _members[i];
-      if (onboardingDelay[member] == 0 && SHARES_TOKEN.balanceOf(member) == 0) {
-        onboardingDelay[member] = delay;
-        amounts[i] = STARTING_SHARES(); // else 0
+      if (orders[member].until == 0 && SHARES_TOKEN.balanceOf(member) == 0) {
+        orders[member] = Orders(true, delay, startingShares);
+        amounts[i] = startingShares; // else 0
       }
 
       unchecked {
@@ -144,8 +147,8 @@ contract QuartermasterShaman is HatsModule {
     for (uint256 i; i < length;) {
       member = _members[i];
       shares = SHARES_TOKEN.balanceOf(member);
-      if (offboardingDelay[member] == 0 && shares > 0) {
-        offboardingDelay[member] = delay;
+      if (orders[member].until == 0 && shares > 0) {
+        orders[member] = Orders(false, delay, shares);
         amounts[i] = shares; // else 0
       }
 
@@ -158,47 +161,38 @@ contract QuartermasterShaman is HatsModule {
   }
 
   /**
-   * Executes onboarding
+   * Executes orders from onboarding and offboarding, any address can only be one or the other
+   * until the orders are executed.
    */
   function quarter(address[] calldata _members) external {
     uint256 length = _members.length;
     uint256[] memory amounts = new uint256[](length);
+    bool[] memory inbound = new bool[](length);
+
+    bool isOnboarding;
+    address[] memory singleMember = new address[](1);
+    uint256[] memory singleShares = new uint256[](1);
 
     for (uint256 i; i < length;) {
       address member = _members[i];
-      if (onboardingDelay[member] != 0 && onboardingDelay[member] <= block.timestamp) {
-        delete onboardingDelay[member];
-        amounts[i] = STARTING_SHARES();
+      if (orders[member].until != 0 && orders[member].until <= block.timestamp) {
+        isOnboarding = inbound[i] = orders[member].isOnboarding;
+        singleMember[0] = member;
+        singleShares[0] = amounts[i] = orders[member].shares;
+        delete orders[member];
+
+        if (isOnboarding) {
+          BAAL().mintShares(singleMember, singleShares);
+        } else {
+          BAAL().burnShares(singleMember, singleShares);
+        }
       }
 
       unchecked {
         ++i;
       }
     }
-    BAAL().mintShares(_members, amounts);
-    emit Quartered(_members, amounts);
-  }
-
-  /**
-   * Executes onboarding
-   */
-  function unquarter(address[] calldata _members) external {
-    uint256 length = _members.length;
-    uint256[] memory amounts = new uint256[](length);
-
-    for (uint256 i; i < length;) {
-      address member = _members[i];
-      if (offboardingDelay[member] != 0 && offboardingDelay[member] <= block.timestamp) {
-        delete offboardingDelay[member];
-        amounts[i] = SHARES_TOKEN.balanceOf(member);
-      }
-
-      unchecked {
-        ++i;
-      }
-    }
-    BAAL().burnShares(_members, amounts);
-    emit Unquartered(_members, amounts);
+    emit Quartered(_members, amounts, inbound);
   }
 
   /*//////////////////////////////////////////////////////////////

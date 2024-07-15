@@ -2,7 +2,7 @@
 pragma solidity ^0.8.19;
 
 import { Test } from "forge-std/Test.sol";
-import { QuartermasterShaman } from "../src/QuartermasterShaman.sol";
+import { QuartermasterShaman, Orders } from "../src/QuartermasterShaman.sol";
 import { DeployImplementation } from "../script/QuartermasterShaman.s.sol";
 import {
   IHats,
@@ -30,8 +30,7 @@ contract QuartermasterShamanTest is DeployImplementation, Test {
 
   event OnboardedBatch(address[] members, uint256[] sharesPending, uint256 delay);
   event OffboardedBatch(address[] members, uint256[] sharesPending, uint256 delay);
-  event Quartered(address[] members, uint256[] shares);
-  event Unquartered(address[] members, uint256[] shares);
+  event Quartered(address[] members, uint256[] shares, bool[] incoming);
 
   function setUp() public virtual {
     // create and activate a fork, at BLOCK_NUMBER
@@ -68,6 +67,7 @@ contract WithInstanceTest is QuartermasterShamanTest {
   address public dao = makeAddr("dao");
   address public captain = makeAddr("captain");
   address public nonWearer = makeAddr("nonWearer");
+  address public prequartered = makeAddr("prequartered");
 
   address public predictedBaalAddress;
   address public predictedShamanAddress;
@@ -142,6 +142,19 @@ contract WithInstanceTest is QuartermasterShamanTest {
     return numArray;
   }
 
+  function makeArray(bool _bool) public pure returns (bool[] memory) {
+    bool[] memory boolArray = new bool[](1);
+    boolArray[0] = _bool;
+    return boolArray;
+  }
+
+  // requires setup being completed
+  function getOrders(address _address) public view returns (Orders memory orders) {
+    (bool isOnboarding, uint256 until, uint256 shares) = shaman.orders(_address);
+    orders = Orders(isOnboarding, until, shares);
+    return orders;
+  }
+
   function setUp() public virtual override {
     super.setUp();
     // set startingShares at 1
@@ -203,6 +216,20 @@ contract Deployment is WithInstanceTest {
   }
 }
 
+contract WithQuarteredTest is WithInstanceTest {
+  function setUp() public virtual override {
+    super.setUp();
+    address[] memory toOnboard = makeArray(prequartered);
+
+    // onboard and quarter
+    vm.prank(captain);
+    shaman.onboard(toOnboard);
+    vm.warp(block.timestamp + 7200);
+    vm.prank(nonWearer);
+    shaman.quarter(toOnboard);
+  }
+}
+
 contract Onboarding is WithInstanceTest {
   function test_captain_canOnboard() public {
     address[] memory toOnboard = makeArray(nonWearer);
@@ -212,7 +239,7 @@ contract Onboarding is WithInstanceTest {
     emit OnboardedBatch(toOnboard, shareArr, 0);
     shaman.onboard(toOnboard);
 
-    assertGt(shaman.onboardingDelay(nonWearer), 0);
+    assertGt(getOrders(nonWearer).until, 0);
   }
 
   function test_nonCaptain_reverts() public {
@@ -221,7 +248,7 @@ contract Onboarding is WithInstanceTest {
     address[] memory toOnboard = makeArray(nonWearer);
     shaman.onboard(toOnboard);
 
-    assertEq(shaman.onboardingDelay(nonWearer), 0);
+    assertEq(getOrders(nonWearer).until, 0);
   }
 
   function test_hasShares_noop() public {
@@ -233,7 +260,7 @@ contract Onboarding is WithInstanceTest {
     vm.prank(captain);
     shaman.onboard(toOnboard);
 
-    assertEq(shaman.onboardingDelay(nonWearer), 0);
+    assertEq(getOrders(nonWearer).until, 0);
   }
 
   function test_inQueue_noop() public {
@@ -242,21 +269,60 @@ contract Onboarding is WithInstanceTest {
     vm.prank(captain);
     shaman.onboard(toOnboard);
 
-    uint256 delay = shaman.onboardingDelay(nonWearer);
+    uint256 delay = getOrders(nonWearer).until;
 
     vm.warp(block.timestamp + 3600);
 
     vm.prank(captain);
     shaman.onboard(toOnboard);
 
-    assertEq(shaman.onboardingDelay(nonWearer), delay);
+    assertEq(getOrders(nonWearer).until, delay);
   }
 }
 
-contract Quartering is WithInstanceTest {
+contract Offboarding is WithQuarteredTest {
+  function test_captain_canOffboard() public {
+    address[] memory toOffboard = makeArray(prequartered);
+    uint256[] memory amounts = makeArray(startingShares);
+    vm.prank(captain);
+    vm.expectEmit(false, false, false, false);
+    emit OffboardedBatch(toOffboard, amounts, 0);
+    shaman.offboard(toOffboard);
+
+    assertGt(getOrders(prequartered).until, 0);
+  }
+
+  function test_notCaptain_noop() public {
+    address[] memory toOffboard = makeArray(prequartered);
+    vm.prank(nonWearer);
+    vm.expectRevert(NotCaptain.selector);
+    shaman.offboard(toOffboard);
+
+    assertEq(getOrders(prequartered).until, 0);
+  }
+
+  function test_inQueue_noop() public {
+    address[] memory toOffboard = makeArray(prequartered);
+
+    vm.prank(captain);
+    shaman.offboard(toOffboard);
+
+    uint256 delay = getOrders(prequartered).until;
+
+    vm.warp(block.timestamp + 3600);
+
+    vm.prank(captain);
+    shaman.offboard(toOffboard);
+
+    assertEq(getOrders(prequartered).until, delay);
+  }
+}
+
+contract Quartering is WithQuarteredTest {
   function test_captain_canQuarter() public {
     address[] memory toOnboard = makeArray(nonWearer);
     uint256[] memory amounts = makeArray(startingShares);
+    bool[] memory incoming = makeArray(true);
 
     vm.prank(captain);
     shaman.onboard(toOnboard);
@@ -264,11 +330,11 @@ contract Quartering is WithInstanceTest {
 
     vm.prank(captain);
     vm.expectEmit(true, false, false, true);
-    emit Quartered(toOnboard, amounts);
+    emit Quartered(toOnboard, amounts, incoming);
     shaman.quarter(toOnboard);
 
     assertEq(sharesToken.balanceOf(nonWearer), startingShares);
-    assertEq(shaman.onboardingDelay(nonWearer), 0);
+    assertEq(getOrders(nonWearer).until, 0);
   }
 
   function test_captain_tooSoon() public {
@@ -295,7 +361,7 @@ contract Quartering is WithInstanceTest {
     shaman.quarter(toOnboard);
 
     assertEq(sharesToken.balanceOf(nonWearer), startingShares);
-    assertEq(shaman.onboardingDelay(nonWearer), 0);
+    assertEq(getOrders(nonWearer).until, 0);
   }
 
   function test_notOnboarded() public {
@@ -306,88 +372,31 @@ contract Quartering is WithInstanceTest {
 
     assertEq(sharesToken.balanceOf(nonWearer), 0);
   }
-}
-
-contract WithQuarteredTest is WithInstanceTest {
-  function setUp() public virtual override {
-    super.setUp();
-    address[] memory toOnboard = makeArray(nonWearer);
-
-    // onboard and quarter
-    vm.prank(captain);
-    shaman.onboard(toOnboard);
-    vm.warp(block.timestamp + 7200);
-    vm.prank(nonWearer);
-    shaman.quarter(toOnboard);
-  }
-}
-
-contract Offboarding is WithQuarteredTest {
-  function test_captain_canOffboard() public {
-    address[] memory toOffboard = makeArray(nonWearer);
-    uint256[] memory amounts = makeArray(startingShares);
-    vm.prank(captain);
-    vm.expectEmit(false, false, false, false);
-    emit OffboardedBatch(toOffboard, amounts, 0);
-    shaman.offboard(toOffboard);
-
-    assertGt(shaman.offboardingDelay(nonWearer), 0);
-  }
-
-  function test_notCaptain_noop() public {
-    address[] memory toOffboard = makeArray(nonWearer);
-    vm.prank(nonWearer);
-    vm.expectRevert(NotCaptain.selector);
-    shaman.offboard(toOffboard);
-
-    assertEq(shaman.offboardingDelay(nonWearer), 0);
-  }
-
-  function test_inQueue_noop() public {
-    address[] memory toOffboard = makeArray(nonWearer);
-
-    vm.prank(captain);
-    shaman.offboard(toOffboard);
-
-    uint256 delay = shaman.offboardingDelay(nonWearer);
-
-    vm.warp(block.timestamp + 3600);
-
-    vm.prank(captain);
-    shaman.offboard(toOffboard);
-
-    assertEq(shaman.offboardingDelay(nonWearer), delay);
-  }
-}
-
-contract Unquartering is WithQuarteredTest {
-  function setUp() public override {
-    super.setUp();
-
-    address[] memory toOffboard = makeArray(nonWearer);
-    vm.prank(captain);
-    shaman.offboard(toOffboard);
-  }
 
   function test_canUnquarter() public {
-    address[] memory toUnquarter = makeArray(nonWearer);
+    address[] memory toUnquarter = makeArray(prequartered);
+
+    vm.prank(captain);
+    shaman.offboard(toUnquarter);
     vm.warp(block.timestamp + 7200);
+
+    assertEq(sharesToken.balanceOf(prequartered), startingShares);
+
     vm.prank(nonWearer);
+    shaman.quarter(toUnquarter);
 
-    assertEq(sharesToken.balanceOf(nonWearer), startingShares);
-
-    shaman.unquarter(toUnquarter);
-
-    assertEq(sharesToken.balanceOf(nonWearer), 0);
+    assertEq(sharesToken.balanceOf(prequartered), 0);
   }
 
   function test_tooSoon_noop() public {
-    address[] memory toUnquarter = makeArray(nonWearer);
+    address[] memory toUnquarter = makeArray(prequartered);
+    vm.prank(captain);
+    shaman.offboard(toUnquarter);
     vm.warp(block.timestamp + 3600);
 
     vm.prank(nonWearer);
-    shaman.unquarter(toUnquarter);
+    shaman.quarter(toUnquarter);
 
-    assertEq(sharesToken.balanceOf(nonWearer), startingShares);
+    assertEq(sharesToken.balanceOf(prequartered), startingShares);
   }
 }
